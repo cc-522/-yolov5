@@ -1,0 +1,271 @@
+//===----------------------------------------------------------------------===//
+//
+// Copyright (C) 2022 Sophgo Technologies Inc.  All rights reserved.
+//
+// TPU-MLIR is licensed under the 2-Clause BSD License except for the
+// third-party components.
+//
+//===----------------------------------------------------------------------===//
+
+#include "tpu_mlir/Dialect/Tpu/Transforms/Codegen/Dynamic/DynamicLayer.hpp"
+#include "tpu_mlir/Support/MathUtils.h"
+
+LogicalResult tpu::ConcatOp::init(InferenceParameter &p) { return success(); }
+void tpu::ConcatOp::deinit(InferenceParameter &p) {}
+
+LogicalResult tpu::ConcatOp::inference(InferenceParameter &p) {
+  auto axis_ = getAxis();
+  bool is_cv18xx = module::isCV18xx();
+  auto nInputs = getInputs().size();
+  auto in0_shape = module::getShape(getInputs()[0]);
+  if (axis_ < 0) {
+    axis_ += in0_shape.size();
+    setAxis(axis_);
+  }
+  int64_t shape_axis = 0;
+  for (auto inp : getInputs()) {
+    auto shape = module::getShape(inp);
+    shape_axis += shape[axis_];
+  }
+  std::vector<int64_t> out_shape(in0_shape);
+  out_shape[axis_] = shape_axis;
+  module::setShape(getOutput(), out_shape);
+  // allocate tmp input
+  std::vector<float *> tmp_inputs(nInputs);
+  for (int i = 0; i < nInputs; ++i) {
+    auto num_elem = module::getNumElements(getInputs()[i]);
+    tmp_inputs[i] = new float[num_elem];
+    memcpy(tmp_inputs[i], p.inputs[i], num_elem * sizeof(float));
+  }
+
+  if (is_cv18xx && module::isUniformQuantized(getOutput())) {
+    auto out_type = module::getStorageType(getOutput());
+    auto multiplier_v = module::getI64Array(getMultipliers(), nInputs, 1);
+    auto rshift_v = module::getI64Array(getRshifts(), nInputs, 0);
+    for (int idx = 0; idx < nInputs; ++idx) {
+      if (multiplier_v->at(idx) == 1 && rshift_v->at(idx) == 0) {
+        continue;
+      }
+      auto num_elem = module::getNumElements(getInputs()[idx]);
+      auto &inp = tmp_inputs[idx];
+#pragma omp parallel for schedule(static, omp_schedule(num_elem))
+      for (int i = 0; i < num_elem; ++i) {
+        inp[i] = applyMultiplierAndRShift(inp[i], multiplier_v->at(idx),
+                                          rshift_v->at(idx));
+        inp[i] = saturate(inp[i], out_type);
+      }
+    }
+  }
+  auto op0_shape = getInputs()[0].getType().cast<RankedTensorType>().getShape();
+
+  int64_t high = 1;
+  for (int64_t i = 0; i < axis_; ++i) {
+    if (op0_shape[i])
+      high *= op0_shape[i];
+  }
+  SmallVector<int64_t> tailNum(getInputs().size());
+  for (auto idt : llvm::enumerate(getInputs())) {
+    tailNum[idt.index()] =
+        idt.value().getType().cast<RankedTensorType>().getNumElements() / high;
+  }
+  auto out_p = p.outputs[0];
+  for (int64_t i = 0; i < high; ++i) {
+    for (auto idt : llvm::enumerate(tailNum)) {
+      memcpy(out_p, tmp_inputs[idt.index()] + i * idt.value(),
+             idt.value() * sizeof(float));
+      out_p += idt.value();
+    }
+  }
+
+  if (getDoRelu()) {
+    auto limit = getReluLimit().convertToDouble();
+    function_relu(p.outputs[0], p.outputs[0],
+                  module::getNumElements(getOutput()), limit);
+  }
+
+  // free tmp input
+  for (int i = 0; i < nInputs; ++i) {
+    delete[] tmp_inputs[i];
+  }
+  return success();
+}
+
+LogicalResult tpu::ConcatOp::LocalGenSupport() {
+  auto shape = module::getShape(getOutput());
+  int num_dims = shape.size();
+  auto ax = getAxis();
+  if (module::isCV18xx()) {
+    if (ax == 1 && (num_dims == 3 || num_dims == 4)) {
+      return success();
+    }
+    return failure();
+  }
+  if (module::isBM1684Family()) {
+    auto status = success();
+    auto runMode = getRunMode(getOperation());
+    if (ax > 3 ||
+        (!module::getStorageType(getOutput()).isInteger(32) && ax == 0)) {
+      status = failure();
+    }
+    if (runMode == RunMode::TPU_DYNAMIC && (ax == 3 && num_dims > 4)) {
+      status = failure();
+    }
+    return status;
+  }
+  do {
+    // for LLM, concat output and input
+    if (module::getAddrMode() == module::AddrMode::IO_ALONE) {
+      auto m = module::getModuleOp(getOperation());
+      std::vector<mlir::Value> ios;
+      module::getInputsOutputs(m, ios, ios);
+      std::vector<StringRef> names;
+      for (auto io : ios) {
+        names.push_back(module::getName(io));
+      }
+      bool allIO = true;
+      for (auto v : getInputs()) {
+        auto name = module::getName(v);
+        if (std::find(names.begin(), names.end(), name) == names.end()) {
+          allIO = false;
+          break;
+        }
+      }
+      if (allIO) {
+        return failure();
+      }
+    }
+  } while (false);
+  return ax > 3 || ax == 0 ? failure() : success();
+}
+
+void tpu::ConcatOp::assign_sec_info_kernel(
+    group_type_t group_type, local_sec_info_t &sec_info,
+    std::vector<group_info_t> &in_group_infos,
+    std::vector<group_info_t> &out_group_infos) {
+  memset(&sec_info, 0, sizeof(local_sec_info_t));
+  sec_info.group_type = group_type;
+  int64_t n, c, d, h, w, on, oc, od, oh, ow;
+  auto input = getOperand(0);
+  auto output = getResult();
+  module::getNCDHW(input, n, c, d, h, w, group_type);
+  module::getNCDHW(output, on, oc, od, oh, ow, group_type);
+  auto gi = out_group_infos[0];
+  auto in_gi = in_group_infos[0];
+  sec_info.n_slice = in_gi.n_slice;
+  sec_info.d_slice = in_gi.d_slice;
+  sec_info.h_slice = gi.h_slice;
+  sec_info.w_slice = gi.w_slice;
+  sec_info.c_slice = gi.c_slice;
+  sec_info.n_idx = in_gi.n_idx;
+  sec_info.d_idx = in_gi.d_idx;
+  sec_info.h_idx = in_gi.h_idx;
+  sec_info.is_h_split = !(in_gi.h_idx == 0 && in_gi.h_slice == h);
+  sec_info.w_idx = in_gi.w_idx;
+  sec_info.is_w_split = !(in_gi.w_idx == 0 && in_gi.w_slice == w);
+  sec_info.c_idx = gi.c_idx;
+  sec_info.is_c_split = !(in_gi.c_idx == 0 && in_gi.c_slice == c);
+  sec_info.out_n_slice = gi.n_slice;
+  sec_info.out_h_idx = gi.h_idx;
+  sec_info.out_h_slice = gi.h_slice;
+  sec_info.out_w_idx = gi.w_idx;
+  sec_info.out_w_slice = gi.w_slice;
+}
+
+void tpu::ConcatOp::assign_fw_param(void *param) {
+  fw_concat_layer_param_t concat_param = {0};
+  concat_param.concat_axis = getAxis();
+  concat_param.input_num = getInputs().size();
+  concat_param.base_dims = module::getShape(getInputs()[0]).size();
+  for (int i = 0; i < concat_param.input_num; ++i) {
+    module::getGlobalShape(getInputs()[i], concat_param.base_shape);
+  }
+  memcpy(param, &concat_param, sizeof(fw_concat_layer_param_t));
+}
+
+LogicalResult tpu::ConcatOp::AllowDataSplit(int64_t axis,
+                                            group_type_t group_type) {
+  return getAxis() == axis ? failure() : success();
+}
+
+bool tpu::ConcatOp::support_multi_core() {
+  if (module::isMultiCoreArch()) {
+    return true;
+  }
+  return false;
+}
+
+bool tpu::ConcatOp::SupportInplace() {
+  if (tpu::getRunMode(getOperation()) == tpu::RunMode::TPU_DYNAMIC) {
+    return false;
+  }
+  if (getOnlyMerge()) {
+    return true;
+  }
+  if (getDoRelu()) {
+    return false;
+  }
+  if (module::isBM1684Family() && module::isUniformQuantized(getOutput())) {
+    // 1684 4N mode not support
+    return false;
+  }
+
+  auto shape = module::getShape(getOutput());
+  int outer_dim = std::accumulate(shape.begin(), shape.begin() + getAxis(), 1,
+                                  std::multiplies<int64_t>());
+  if (outer_dim != 1) {
+    return false;
+  }
+  int multi_use_times = 0;
+  for (auto in : getInputs()) {
+    if (module::isWeight(in)) {
+      return false;
+    }
+    int same_op_times = 0;
+    if (in.hasOneUse() == false) {
+      multi_use_times++;
+      for (auto v : getInputs()) {
+        if (in == v) {
+          same_op_times++;
+        }
+      }
+
+      // if value is used by multiple ConcatOp, only one ConcatOp should be
+      // setOnlyMerge
+      for (auto user : in.getUsers()) {
+        if (auto other_cat = dyn_cast<tpu::ConcatOp>(user)) {
+          if (other_cat.getOnlyMerge()) {
+            return false;
+          }
+        }
+      }
+
+      if (same_op_times > 1) {
+        return false;
+      }
+    }
+    if (multi_use_times > 2) {
+      return false;
+    }
+    auto in_op = in.getDefiningOp();
+    if (in_op == nullptr) {
+      // return false;
+    } else if (isa<tpu::ConcatOp>(in_op)) {
+      return false;
+    } else if (auto rshape = dyn_cast<tpu::ReshapeOp>(in_op)) {
+      if (in != this->getOperand(0)) {
+        return false;
+      }
+      auto in2 = rshape.getInput();
+      if (in2.getDefiningOp() == nullptr || in2.hasOneUse() == false) {
+        return false;
+      }
+    } else if (auto sliceOp = dyn_cast<tpu::SliceOp>(in_op)) {
+      auto p = sliceOp.parseParam();
+      if (p.fusible) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}

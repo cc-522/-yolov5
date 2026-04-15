@@ -1,0 +1,51 @@
+//===----------------------------------------------------------------------===//
+//
+// Copyright (C) 2022 Sophgo Technologies Inc.  All rights reserved.
+//
+// TPU-MLIR is licensed under the 2-Clause BSD License except for the
+// third-party components.
+//
+//===----------------------------------------------------------------------===//
+
+#pragma once
+
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Quant/QuantOps.h"
+#include "tpu_mlir/Dialect/Top/IR/TopOps.h"
+#include "tpu_mlir/Dialect/Tpu/IR/TpuOps.h"
+
+namespace tpu_mlir {
+namespace tpu {
+
+std::unique_ptr<OperationPass<ModuleOp>> createOpReorderPass();
+std::unique_ptr<OperationPass<ModuleOp>> createWeightReorderPass();
+std::unique_ptr<OperationPass<ModuleOp>> createSubnetDividePass();
+std::unique_ptr<OperationPass<ModuleOp>> createAddressAssignPass();
+std::unique_ptr<OperationPass<ModuleOp>> createCodegenPass();
+std::unique_ptr<OperationPass<ModuleOp>> createStripIOQuant();
+std::unique_ptr<OperationPass<ModuleOp>> createTopoSortPass();
+std::unique_ptr<OperationPass<ModuleOp>> createLayerGroupPass();
+std::unique_ptr<OperationPass<ModuleOp>> createDynCodegenPass();
+std::unique_ptr<OperationPass<ModuleOp>> createProcessorOptimizePass();
+std::unique_ptr<OperationPass<ModuleOp>> createOpDividePass();
+std::unique_ptr<OperationPass<ModuleOp>> createDevParallelPass();
+std::unique_ptr<OperationPass<ModuleOp>> createCoreParallelPass();
+std::unique_ptr<OperationPass<ModuleOp>> createWeightFoldPass();
+std::unique_ptr<OperationPass<ModuleOp>> createShapeOptimizePass();
+std::unique_ptr<OperationPass<ModuleOp>> createShowAddressPass();
+std::unique_ptr<OperationPass<ModuleOp>> createTruncIOPass();
+std::unique_ptr<OperationPass<ModuleOp>> createNetStatisticPass();
+std::unique_ptr<OperationPass<ModuleOp>> createTruncLayerPass();
+std::unique_ptr<OperationPass<ModuleOp>> createCutFinalMlirPass();
+std::unique_ptr<OperationPass<ModuleOp>> createOptPostProcessorPass();
+std::unique_ptr<OperationPass<ModuleOp>> createTimeFixedSubnetPass();
+std::unique_ptr<OperationPass<ModuleOp>>
+createAfterLayerGroupWeightReorderPass();
+std::unique_ptr<OperationPass<ModuleOp>> createWeightDeduplicatePass();
+
+#define GEN_PASS_REGISTRATION
+#define GEN_PASS_CLASSES
+#include "tpu_mlir/Dialect/Tpu/Transforms/Passes.h.inc"
+
+} // namespace tpu
+} // namespace tpu_mlir

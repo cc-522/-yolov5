@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+# ==============================================================================
+#
+# Copyright (C) 2025 Sophgo Technologies Inc.  All rights reserved.
+#
+# TPU-MLIR is licensed under the 2-Clause BSD License except for the
+# third-party components.
+#
+# ==============================================================================
+
+import argparse
+import pymlir
+
+
+def parse_max_pixels(value):
+    """
+    If the input is a single number, convert it to an integer.
+    If it contains a comma, parse it as a tuple (or list) of two integers, e.g., "128,124".
+    """
+    if ',' in value:
+        parts = value.split(',')
+        if len(parts) != 2:
+            raise argparse.ArgumentTypeError(
+                "The input must be two integers separated by a comma, e.g., 128,124")
+        try:
+            width = int(parts[0].strip())
+            height = int(parts[1].strip())
+        except ValueError:
+            raise argparse.ArgumentTypeError("The input values must be integers, e.g., 128,124")
+        return int(width * height), [width, height]
+    else:
+        try:
+            return int(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                "The input must be an integer or two integers separated by a comma, e.g., 128,124")
+
+
+def deprecated_option(cond, msg):
+    if cond:
+        raise RuntimeError(msg)
+
+
+if __name__ == '__main__':
+    # yapf: disable
+    parser = argparse.ArgumentParser(description='llm_exporter', formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument('-m', '--model_path', type=str, required=True,
+                        help='original weight, like ./Qwen2-7B-Instruct')
+    parser.add_argument('-s', '--seq_length', type=int, required=True,
+                        help="sequence length")
+    parser.add_argument('-q', '--quantize', type=str, default="auto",
+                        choices=["auto", "bf16", "w8bf16", "w4bf16", "f16", "w8f16", "w4f16"],
+                        help="quantize type for bmodel")
+    parser.add_argument('-g', "--q_group_size", default=64, type=int,
+                        help="group size for per-group quant, only used in quant mode")
+    parser.add_argument('-c', '--chip', "--processor", type=str, default="bm1684x",
+                        choices=["bm1684x", "bm1688", "cv186x", "bm1690"],
+                        help="chip type for bmodel")
+    parser.add_argument('--num_device', type=int, default=1,
+                        help="num device for bmodel")
+    parser.add_argument('--num_core', type=int, default=0, help="num cores for bmodel")
+    parser.add_argument('-b', '--batch', type=int, default=1,
+                        help='batch size for bmodel')
+    parser.add_argument('--lora_max_rank', type=int, default=0, help="lora rank, default is 0 means no lora")
+    parser.add_argument('--symmetric', action='store_true', help='do symmetric quantize')
+    parser.add_argument('--embedding_disk', action='store_true',
+                        help='export embedding as bin file and inference by cpu')
+    parser.add_argument('--do_sample', action='store_true',
+                        help='Add sample head and separate greedy head from lmhead')
+    parser.add_argument('--use_block_with_kv', action='store_true',
+                        help='use history kv for prefill, default is False')
+    parser.add_argument('--share_prompt', action='store_true',
+                        help='share the same prompt for multi dialog, default is False')
+    parser.add_argument('--max_input_length', type=int, default=0,
+                        help='max input length for prefill, default 0 means the same as seq_length')
+    parser.add_argument('--max_prefill_kv_length', type=int, default=0,
+                        help='max prefill kv length, default 0 means the same as seq_length')
+    parser.add_argument('--max_pixels', type=parse_max_pixels, default=0,
+                        help="max pixels for vit, for example: 240,420 or 100800")
+    parser.add_argument('--dynamic', action='store_true',
+                        help='enable dynamic compiling for llm prefill')
+    parser.add_argument('--debug', action='store_true',
+                        help='enable debug mode, temp files will not be deleted')
+    parser.add_argument('--only_mlir', action='store_true', help='only export mlir file, do not convert to bmodel')
+    parser.add_argument('--rvti', action='store_true',
+                        help='enable rvti, only for bm1684x2 and bm1690e')
+    parser.add_argument("--again", action='store_true',
+                        help='continue to convert the model, default is False')
+    parser.add_argument("-V", "--version", action='version', version='%(prog)s ' + pymlir.__version__)
+    parser.add_argument('-o', '--out_dir', type=str, default='./tmp',
+                        help='output mlir/bmodel path, default `./tmp`')
+    #========== DEPRECATED Options ==============
+    parser.add_argument("--dynamic_vit", action='store_true',
+                        help='enable dynamic compiling for vit')
+    parser.add_argument('--input_length_list', action="store_true",
+                        help="a list of input lengths separated by '+', each input length can be a single integer")
+    args = parser.parse_args()
+    deprecated_option(args.dynamic_vit, "DEPRECATED,default is dynamic compiling")
+    deprecated_option(args.input_length_list, "DEPRECATED, please use --dynamic to enable dynamic compiling")
+    # yapf: enable
+    if args.share_prompt:
+        args.use_block_with_kv = True
+    if args.input_length_list and args.max_input_length > 0:
+        raise ValueError("Cannot set both input_length_list and max_input_length.")
+    if args.use_block_with_kv:
+        if args.max_input_length <= 0:
+            args.max_input_length = args.seq_length // 4
+            print("Warning: max_input_length is not set, use seq_length // 4 as default value: {}".
+                  format(args.max_input_length))
+        elif args.max_input_length > args.seq_length // 2:
+            raise ValueError(
+                "max_input_length should not be larger than seq_length // 2, got: {}".format(
+                    args.max_input_length))
+    if args.max_prefill_kv_length <= 0:
+        args.max_prefill_kv_length = args.seq_length
+    elif args.max_prefill_kv_length > args.seq_length:
+        raise ValueError(
+            "max_prefill_kv_length should not be larger than seq_length, got: {}".format(
+                args.max_prefill_kv_length))
+    if isinstance(args.max_pixels, tuple):
+        max_pixels, max_shape = args.max_pixels
+        args.max_pixels = max_pixels
+        args.max_shape = max_shape
+    else:
+        args.max_shape = None
+
+    from transformers import AutoConfig
+    config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
+
+    if config.model_type in ["qwen3", "qwen2", "llama", "minicpm"]:
+        from llm.LlmConverter import LlmConverter
+        converter = LlmConverter(args, config)
+    elif config.model_type in ["mllama"]:
+        from llm.Llama3_2VConverter import Llama3_2VConverter
+        converter = Llama3_2VConverter(args, config)
+    elif config.model_type in ["chatglm"]:
+        from llm.Chatglm3Converter import Chatglm3Converter
+        converter = Chatglm3Converter(args, config)
+    elif config.model_type in ["phi3"]:
+        from llm.Phi3Converter import Phi3Converter
+        converter = Phi3Converter(args, config)
+    elif config.model_type in ['qwen2_vl']:
+        from llm.Qwen2VLConverter import Qwen2VLConverter
+        converter = Qwen2VLConverter(args, config)
+    elif config.model_type in ['qwen2_5_vl']:
+        from llm.Qwen2_5VLConverter import Qwen2_5VLConverter
+        converter = Qwen2_5VLConverter(args, config)
+    elif config.model_type in ['qwen3_vl']:
+        from llm.Qwen3VLConverter import Qwen3VLConverter
+        converter = Qwen3VLConverter(args, config)
+    elif config.model_type in ['qwen3_5']:
+        from llm.Qwen3_5Converter import Qwen3_5Converter
+        converter = Qwen3_5Converter(args, config)
+    elif config.model_type in ['qwen2_5_omni']:
+        from llm.Qwen2_5OConverter import Qwen2_5OConverter
+        converter = Qwen2_5OConverter(args, config)
+    elif config.model_type in ['internvl_chat']:
+        from llm.InternVL3Converter import InternVL3Converter
+        converter = InternVL3Converter(args, config)
+    elif config.model_type in ['gemma3']:
+        from llm.Gemma3Converter import Gemma3Converter
+        converter = Gemma3Converter(args, config)
+    elif config.model_type in ['glm4v']:
+        from llm.GLM4VConverter import GLM4VConverter
+        converter = GLM4VConverter(args, config)
+    elif config.model_type in ['minicpmv']:
+        from llm.MiniCPMV4Converter import MiniCPMV4Converter
+        converter = MiniCPMV4Converter(args, config)
+    elif config.model_type in ['janus']:
+        from llm.JanusConverter import JanusConverter
+        converter = JanusConverter(args, config)
+    elif config.model_type in ['paddleocr_vl']:
+        from llm.PaddleOCRVLConverter import PaddleOCRVLConverter
+        converter = PaddleOCRVLConverter(args, config)
+    else:
+        raise RuntimeError("Unsupported model type: {}".format(config.model_type))
+    converter.run()

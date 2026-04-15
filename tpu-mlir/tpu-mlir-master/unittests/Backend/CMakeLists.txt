@@ -1,0 +1,7 @@
+add_tpumlir_unittest(
+MLIRIRInterfaceTests
+InterfaceTest.cpp
+PARTIAL_SOURCES_INTENDED
+)
+
+target_link_libraries(MLIRIRInterfaceTests PRIVATE MLIRIR)
